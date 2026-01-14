@@ -253,3 +253,97 @@ class Importer(csv_multitable_reader.Importer):
                 debug_file.write(pformat({"prepared_tables": self.alltables}))
 
         self.file_read_done = True
+
+
+class CustomMultiTableImporter(csv_multitable_reader.Importer):
+    """
+    A reader that converts a pdf with tables into a multi-petl-table format understood by transaction builders.
+    This importer allows explicit definition of table locations and page crop areas.
+
+    ### Attributes customized in `custom_init`
+    self.pdf_table_definitions: `[{'page': int, 'bbox': (int,int,int,int), 'section': str}]`
+        A list of dictionaries, where each dictionary defines a table to extract:
+        - 'page': The 1-based page number where the table is located.
+        - 'bbox': A tuple (x0, y0, x1, y1) defining the bounding box of page area to crop for the table.
+        - 'table_extraction_settings': A dictionary containing settings used to extract tables, see [pdfplumber documentation](https://github.com/jsvine/pdfplumber?tab=readme-ov-file#table-extraction-settings) for what settings are available
+        - 'section': The name to use for this table section in `self.alltables`.
+
+    ### Outputs
+    self.meta_text: `str`
+        contains all text found in the document outside of tables
+
+    self.alltables: `{'table_1': <petl table of first table in document>, ...}`
+        contains all the tables found in the document keyed by the extracted title if available, otherwise by the 1-based index in the form of `table_#`
+    """
+
+    FILE_EXTS = ["pdf"]
+
+    def initialize_reader(self, file):
+        if getattr(self, "file", None) != file:
+            self.file = file
+            self.meta_text = ""
+            self.debug_images = {}
+            self.file_read_done = False
+            self.reader_ready = True
+
+    def prepare_tables(self):
+        """Make final adjustments to tables before processing by the transaction builder."""
+        for section, table in self.alltables.items():
+            header_map = self.pdf_table_definitions[section].get("header_map", {})
+            table = table.rename(header_map)
+            table = self.convert_columns(table)
+            table = self.fix_column_names(table)
+            table = self.prepare_processed_table(
+                table
+            )  # override this to make additonal adjustments
+
+            self.alltables[section] = table
+        return
+
+    def get_adjusted_crop(self, page, bbox):
+        """Calculate the adjusted crop coordinates for the page."""
+        return (
+            min(bbox[0], page.width),
+            min(bbox[1], page.height),
+            max(bbox[2], 0),
+            max(bbox[3], 0),
+        )
+
+    def read_file(self, file):
+        """Main method to read and process a PDF into self.alltables using explicit table definitions."""
+        if self.file_read_done:
+            return
+
+        self.meta_text = ""
+        tables_data = []
+
+        with pdfplumber.open(file) as pdf:
+            for page in pdf.pages:
+                self.meta_text += page.extract_text()
+            for section, table_def in self.pdf_table_definitions.items():
+                page = pdf.pages[table_def.get("page", 1) - 1]
+                bbox = self.get_adjusted_crop(
+                    page, table_def.get("bbox", (0, 0, page.width, page.height))
+                )
+                extraction_settings = table_def.get("table_extraction_settings", {})
+                cropped_area = page.crop(bbox)
+
+                if self.debug:
+                    image = cropped_area.to_image(resolution=400)  # debug
+                    image.debug_tablefinder(extraction_settings)  # debug
+                    self.debug_images[section] = image  # debug
+                    self.debug_images[section].save(
+                        ".debug-pdf-table-detection-section_{}.png".format(section)
+                    )  # debug
+
+                extracted_table = cropped_area.extract_table(extraction_settings)
+                tables_data.append({"section": section, "table": extracted_table, "bbox": bbox})
+
+        self.alltables = {table["section"]: etl.wrap(table["table"]) for table in tables_data}
+        self.prepare_tables()
+
+        if self.debug:  # debug
+            with open(".debug-pdf-prepared-tables.txt", "w") as debug_file:
+                debug_file.write(pformat({"prepared_tables": self.alltables}))
+
+        self.file_read_done = True
